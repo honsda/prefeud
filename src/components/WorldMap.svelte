@@ -315,6 +315,8 @@
   }
 
   let transport: SprawlTransport | null = null;
+  let workerDead = false; // once tripped, all solves run on the main thread
+  let localFallback: SprawlTransport | null = null;
 
   function createWorkerTransport(): SprawlTransport | null {
     try {
@@ -323,6 +325,16 @@
       // replies echo the solve tag; queries echo their id — overlapping
       // solves resolve independently, callers discard stale ones by tag
       const pending = new Map<string, (r: SolveResult | QueryResult) => void>();
+      const failAll = () => {
+        for (const [, res] of pending) {
+          try {
+            res({ ok: false, reason: 'stale' } as SolveResult);
+          } catch {
+            /* ignore */
+          }
+        }
+        pending.clear();
+      };
       worker.onmessage = (ev: MessageEvent) => {
         const m = ev.data as { kind: string; tag?: string; key?: string; id?: number } & (SolveResult | QueryResult);
         if (m.kind === 'solved' || m.kind === 'grown') {
@@ -336,27 +348,61 @@
           res?.(m as QueryResult);
         }
       };
-      worker.onerror = () => {};
+      // a dead worker must never hang solves: fail everything in flight and
+      // permanently fall back to the main-thread session for future solves
+      worker.onerror = () => {
+        workerDead = true;
+        failAll();
+        try {
+          worker.terminate();
+        } catch {
+          /* ignore */
+        }
+        if (transport) {
+          transport = null;
+        }
+        sprawlStat = 'sim worker failed — main-thread fallback';
+        scheduleSprawl();
+      };
       return {
         solve: (job) =>
           new Promise<SolveResult>((resolve) => {
             pending.set(`s:${job.tag}`, resolve as (r: SolveResult | QueryResult) => void);
-            worker.postMessage({ kind: 'solve', job });
+            try {
+              worker.postMessage({ kind: 'solve', job });
+            } catch {
+              pending.delete(`s:${job.tag}`);
+              resolve({ ok: false, reason: 'bad-input' });
+            }
           }),
         grow: (prevTag, newTag, budget) =>
           new Promise<SolveResult>((resolve) => {
             pending.set(`s:${prevTag}`, resolve as (r: SolveResult | QueryResult) => void);
-            worker.postMessage({ kind: 'grow', prev: prevTag, tag: newTag, budget });
+            try {
+              worker.postMessage({ kind: 'grow', prev: prevTag, tag: newTag, budget });
+            } catch {
+              pending.delete(`s:${prevTag}`);
+              resolve({ ok: false, reason: 'stale' });
+            }
           }),
         query: (q) =>
           new Promise<QueryResult>((resolve) => {
             const id = qseq++;
             pending.set(`q:${id}`, resolve as (r: SolveResult | QueryResult) => void);
-            worker.postMessage({ kind: 'query', id, q });
+            try {
+              worker.postMessage({ kind: 'query', id, q });
+            } catch {
+              pending.delete(`q:${id}`);
+              resolve({ ok: false });
+            }
           }),
         shutdown: () => {
           pending.clear();
-          worker.terminate();
+          try {
+            worker.terminate();
+          } catch {
+            /* ignore */
+          }
         },
       };
     } catch {
@@ -367,14 +413,30 @@
   function createLocalTransport(): SprawlTransport {
     const session = new SprawlSession();
     return {
-      solve: (job) => session.solve(job),
-      grow: (prevTag, newTag, budget) => session.grow(prevTag, newTag, budget),
+      solve: async (job) => {
+        try {
+          return await session.solve(job);
+        } catch {
+          return { ok: false, reason: 'stale' as const };
+        }
+      },
+      grow: async (prevTag, newTag, budget) => {
+        try {
+          return await session.grow(prevTag, newTag, budget);
+        } catch {
+          return { ok: false, reason: 'stale' as const };
+        }
+      },
       query: (q) => Promise.resolve(session.query(q)),
       shutdown: () => {},
     };
   }
 
   function engine(): SprawlTransport {
+    if (workerDead) {
+      if (!localFallback) localFallback = createLocalTransport();
+      return localFallback;
+    }
     if (!transport) transport = createWorkerTransport() ?? createLocalTransport();
     return transport;
   }
@@ -610,6 +672,91 @@
     if (Math.abs(world.scale.x / lastBorderScale - 1) > 0.02) paintSprawlBorders();
   }
 
+  type FineFields = {
+    elev: Float32Array;
+    bio: Int16Array;
+    land: Uint8Array | null;
+    lake: Uint8Array | null;
+    barrier: Uint8Array | null;
+  };
+
+  /** Sample + rasterize one box's fields on the main thread (caches live
+   *  outside; the worker only ever sees typed arrays). Null when vectors
+   *  aren't ready for masks (falls back to elev/biome rules) or on abort. */
+  async function buildFineFields(
+    ox: number,
+    oy: number,
+    w: number,
+    h: number,
+    cell: number,
+    stale: () => boolean,
+  ): Promise<FineFields | null> {
+    let landM: Uint8Array | null = null;
+    let lakeM: Uint8Array | null = null;
+    let barM: Uint8Array | null = null;
+    if (landReady()) {
+      const view = boxView(ox, oy, w, h, cell);
+      try {
+        landM = rasterizeLandMask(view);
+      } catch {
+        landM = null;
+      }
+      try {
+        lakeM = rasterizeLakeMask(view);
+      } catch {
+        lakeM = null;
+      }
+      try {
+        const tol = 0.25 / (((world ? world.scale.x : baseScale) * dataW) / LON_SPAN);
+        const feats = bigRiverFeatures(Math.max(1e-6, tol));
+        if (feats.length > 0) barM = rasterizeRiverBarrier(view, feats, cell >= 0.5 ? 2 : 3);
+      } catch {
+        barM = null;
+      }
+      if (stale()) return null;
+    }
+    const { elevAt, biomeAt } = makeBoxSamplers(ox, oy, ox + w * cell, oy + h * cell);
+    const f = await sampleFields(ox, oy, w, h, cell, elevAt, biomeAt, stale);
+    if (!f) return null;
+    return { elev: f.elev, bio: f.bio, land: landM, lake: lakeM, barrier: barM };
+  }
+
+  /** Coarse boundary ring for one box: lets off-box seeds compete without
+   *  unioning them into the box (same cost×km units). */
+  function buildInjection(
+    ox: number,
+    oy: number,
+    w: number,
+    h: number,
+    cell: number,
+    geo: string,
+  ): { i: number; dist: number; owner: number }[] | undefined {
+    if (!coarse || coarseTag !== geo) return undefined;
+    const initial: { i: number; dist: number; owner: number }[] = [];
+    const RING = 2;
+    const use = coarse;
+    const probe = (fx: number, fy: number) => {
+      const cx = Math.max(0, Math.min(dataW - 1, Math.floor(ox + (fx + 0.5) * cell)));
+      const cy = Math.max(0, Math.min(dataH - 1, Math.floor(oy + (fy + 0.5) * cell)));
+      const ci = cy * dataW + cx;
+      const o = use.owner[ci];
+      if (o >= 0 && o < nodes.length) initial.push({ i: fy * w + fx, dist: use.dist[ci], owner: o });
+    };
+    for (let x = 0; x < w; x++) {
+      for (let r = 0; r < RING; r++) {
+        probe(x, r);
+        probe(x, h - 1 - r);
+      }
+    }
+    for (let y = RING; y < h - RING; y++) {
+      for (let r = 0; r < RING; r++) {
+        probe(r, y);
+        probe(w - 1 - r, y);
+      }
+    }
+    return initial;
+  }
+
   async function recomputeSprawl() {
     if (!ready || disposed) return;
     if (nodes.length === 0) {
@@ -617,10 +764,11 @@
       sprawlStat = '';
       lastFineTag = null;
       lastFineBoxKey = null;
+      lastFineGeo = null;
       return;
     }
     // keep the old overlay visible while computing — swap on ready, no flicker
-    sprawlStat = 'computing…';
+    sprawlStat = 'computing coarse…';
     const gen = ++sprawlGen;
     const stale = () => gen !== sprawlGen || disposed;
     const geo = geoTag();
@@ -637,6 +785,7 @@
         return;
       }
     }
+    sprawlStat = 'computing…';
 
     // 2) viewport box at native display resolution, snapped to the cell grid
     const plan = planFineBox();
@@ -677,71 +826,62 @@
       return;
     }
 
-    // costs: memory LRU or fresh fields (sampling + vector masks, main thread)
+    // costs: memory LRU or fresh fields (sampling + vector masks, main thread).
+    // Sea, lakes and big rivers stay unpainted, exactly as drawn.
+    // (Before vectors load we fall back to the elev/biome rule, then re-sim.)
     const dtag = dataTag();
     const ck = costKey(bx0, by0, w, h, cell, dtag);
     let costs = costMemGet(ck);
-    let fields: { elev: Float32Array; bio: Int16Array; land: Uint8Array | null; lake: Uint8Array | null; barrier: Uint8Array | null } | null = null;
+    let fields: FineFields | null = null;
     if (!costs) {
-      // Land truth = the same vectors the tiles paint, rasterized at sim res.
-      // Small waters are painted over; big lakes + big rivers stay blockers.
-      // (Before vectors load we fall back to the elev/biome rule, then re-sim.)
-      let landM: Uint8Array | null = null;
-      let lakeM: Uint8Array | null = null;
-      let barM: Uint8Array | null = null;
-      if (landReady()) {
-        const view = boxView(bx0, by0, w, h, cell);
-        try {
-          landM = rasterizeLandMask(view);
-        } catch {
-          landM = null;
-        }
-        try {
-          lakeM = rasterizeLakeMask(view);
-        } catch {
-          lakeM = null;
-        }
-        try {
-          const tol = 0.25 / (((world ? world.scale.x : baseScale) * dataW) / LON_SPAN);
-          const feats = bigRiverFeatures(Math.max(1e-6, tol));
-          if (feats.length > 0) barM = rasterizeRiverBarrier(view, feats, cell >= 0.5 ? 2 : 3);
-        } catch {
-          barM = null;
-        }
-        if (stale()) return;
-      }
-      const { elevAt, biomeAt } = makeBoxSamplers(bx0, by0, bx0 + w * cell, by0 + h * cell);
-      const f = await sampleFields(bx0, by0, w, h, cell, elevAt, biomeAt, stale);
+      const f = await buildFineFields(bx0, by0, w, h, cell, stale);
       if (!f || stale()) return;
-      fields = { elev: f.elev, bio: f.bio, land: landM, lake: lakeM, barrier: barM };
+      fields = f;
     }
     // inside seeds compete from 0; outside seeds arrive through the coarse
     // boundary ring (same cost×km units), so the box stays viewport-sized
-    let initial: { i: number; dist: number; owner: number }[] | undefined;
-    if (coarse && coarseTag === geo) {
-      initial = [];
-      const RING = 2;
-      const use = coarse;
-      const probe = (fx: number, fy: number) => {
-        const cx = Math.max(0, Math.min(dataW - 1, Math.floor(bx0 + (fx + 0.5) * cell)));
-        const cy = Math.max(0, Math.min(dataH - 1, Math.floor(by0 + (fy + 0.5) * cell)));
-        const ci = cy * dataW + cx;
-        const o = use.owner[ci];
-        if (o >= 0 && o < nodes.length) initial!.push({ i: fy * w + fx, dist: use.dist[ci], owner: o });
-      };
-      for (let x = 0; x < w; x++) {
-        for (let r = 0; r < RING; r++) {
-          probe(x, r);
-          probe(x, h - 1 - r);
+    const initial = buildInjection(bx0, by0, w, h, cell, geo);
+
+    // preview-then-refine: a cell×2 preview paints in ~1s so deep zoom never
+    // sits on stretched coarse blocks, then the native solve swaps in.
+    // The preview sets no tags (budget grows only ever resume full solves).
+    if (cell < 1 && w * h > 800000) {
+      const pc = cell * 2;
+      const pox = Math.floor(bx0 / pc) * pc;
+      const poy = Math.floor(by0 / pc) * pc;
+      const pw = Math.max(1, Math.ceil((bx0 + w * cell - pox) / pc));
+      const ph = Math.max(1, Math.ceil((by0 + h * cell - poy) / pc));
+      const pf = await buildFineFields(pox, poy, pw, ph, pc, stale);
+      if (stale()) return;
+      if (pf) {
+        const pr = await engine().solve({
+          tag: `${ftag}:preview`,
+          scope: 'fine',
+          box: { ox: pox, oy: poy, w: pw, h: ph, cell: pc },
+          seedsE0: nodes.map((n) => ({ x: n.dx, y: n.dy })),
+          budget,
+          capital: capitalIndex(),
+          initial: buildInjection(pox, poy, pw, ph, pc, geo),
+          payload: { fields: pf },
+          wantDist: false,
+        });
+        if (stale()) return;
+        if (pr.ok) {
+          lastSim = { w: pw, h: ph, cost: new Float32Array(0), blocked: new Uint8Array(0), ox: pox, oy: poy, cell: pc };
+          lastSprawl = {
+            owner: pr.owner!,
+            dist: new Float32Array(0),
+            counts: pr.counts!,
+            centroids: pr.centroids!,
+            contours: pr.contours ?? [],
+          };
+          paintSprawlOverlay();
+          sprawlStat = 'refining…';
         }
       }
-      for (let y = RING; y < h - RING; y++) {
-        for (let r = 0; r < RING; r++) {
-          probe(r, y);
-          probe(w - 1 - r, y);
-        }
-      }
+      if (stale()) return;
     }
+
     const res = await engine().solve({
       tag: ftag,
       scope: 'fine',
@@ -781,7 +921,7 @@
     };
     applyFineTags(ftag, boxKey, budget, geo);
     paintSprawlOverlay();
-    updateSprawlStat();
+    updateSprawlStat(res.ms);
   }
 
   /** Budget-aware global stats from the coarse max-budget solve: Dijkstra
@@ -810,7 +950,7 @@
     return { counts, centroids };
   }
 
-  function updateSprawlStat() {
+  function updateSprawlStat(ms?: number) {
     if (nodes.length === 0) {
       sprawlStat = '';
       return;
@@ -821,7 +961,8 @@
     const kx0 = ((LON_SPAN / dataW) * 111.32 * Math.cos((latMid * Math.PI) / 180));
     const ky0 = ((LAT_SPAN / dataH) * 110.57);
     const km2 = Math.round(cells * kx0 * ky0);
-    sprawlStat = `${cells.toLocaleString('en-US')} px ≈ ${km2.toLocaleString('en-US')} km² across ${nodes.length} node${nodes.length > 1 ? 's' : ''}`;
+    const timed = ms != null && ms > 0 ? ` · ${(ms / 1000).toFixed(1)}s` : '';
+    sprawlStat = `${cells.toLocaleString('en-US')} px ≈ ${km2.toLocaleString('en-US')} km² across ${nodes.length} node${nodes.length > 1 ? 's' : ''}${timed}`;
     if (selectedId != null) void refreshSelected();
   }
 
