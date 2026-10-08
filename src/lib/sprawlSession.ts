@@ -19,6 +19,7 @@ export interface SolveFields {
   land: Uint8Array | null;
   lake: Uint8Array | null;
   barrier: Uint8Array | null;
+  ford: Float32Array | null;
 }
 
 export interface SolveCosts {
@@ -89,7 +90,8 @@ export class SprawlSession {
     if ('fields' in job.payload) {
       const f = job.payload.fields;
       if (f.elev.length !== n || f.bio.length !== n) return { ok: false, reason: 'bad-input' };
-      sim = buildCosts(ox, oy, w, h, cell, f.elev, f.bio, null, {
+      const ford = f.ford && f.ford.length === n ? f.ford : null;
+      sim = buildCosts(ox, oy, w, h, cell, f.elev, f.bio, ford, {
         land: f.land,
         lake: f.lake,
         barrier: f.barrier,

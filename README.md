@@ -50,9 +50,10 @@ npm run dev
   max budget) picks global winners, then a viewport-native solve (1 sim px =
   1 map px at the current LOD, cell-grid-snapped and box-anchored) paints a
   flat raster fill with smooth vector borders (marching-squares + Chaikin,
-  constant screen width) — the classic look, crisp at any zoom. Sea, lakes and
-  big rivers (bundled detail + NE rank ≤ 2, rasterized as unbroken barriers)
-  stay unpainted, exactly as drawn. Off-screen nodes still compete via boundary
+  constant screen width) — the classic look, crisp at any zoom. Sea, lakes
+  (any size) and big rivers (bundled detail + NE rank ≤ 2, rasterized as
+  unbroken barriers) stay unpainted, exactly as drawn; minor streams bend
+  growth gently with ford costs on the same drawn courses. Off-screen nodes still compete via boundary
   injection; stats and centroids are budget-filtered from the coarse distances
   (no re-solve per slider tick). Snow/peaks/deserts costly; fields and settled
   land cheap; slope + altitude penalized. Sprawl-level slider sets the

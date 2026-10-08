@@ -342,9 +342,10 @@ export function drawLakes(
   return drawn;
 }
 
-/** Rasterize lake water to bytes (1 = lake). Same polygons + LOD culling as
- *  drawLakes, so the sim blocks exactly the water the tiles paint. Null when
- *  nothing is loaded yet (callers fall back to elev/biome rules). */
+/** Rasterize lake water to bytes (1 = lake). NO size culling: every polygon
+ *  the canvas catches blocks, so ponds are avoided at any zoom (tiles keep
+ *  their own LOD via drawLakes — this mask is sim-only). Null when nothing
+ *  is loaded yet (callers fall back to elev/biome rules). */
 export function rasterizeLakeMask(v: HydroView): Uint8Array | null {
   if (!lakes && detailLakes.length === 0) return null;
   const c = document.createElement('canvas');
@@ -358,10 +359,6 @@ export function rasterizeLakeMask(v: HydroView): Uint8Array | null {
   const padY = (v.latMax - v.latMin) * 0.02 + 0.25;
   const culled = (bb: [number, number, number, number]) =>
     bb[2] < v.lonMin - padX || bb[0] > v.lonMax + padX || bb[3] < v.latMin - padY || bb[1] > v.latMax + padY;
-  const degX = (v.lonMax - v.lonMin) / v.w;
-  const degY = (v.latMax - v.latMin) / v.h;
-  const tooSmall = (bb: [number, number, number, number]) =>
-    (bb[2] - bb[0]) / degX < 2 && (bb[3] - bb[1]) / degY < 2;
   const paintOne = (polys: HydroPoly[]) => {
     const p = new Path2D();
     for (const poly of polys) {
@@ -379,18 +376,16 @@ export function rasterizeLakeMask(v: HydroView): Uint8Array | null {
   };
   for (const lake of detailLakes) {
     if (culled(lake.bbox)) continue;
-    const polys = lake.polys.filter((p) => !tooSmall(p.bbox));
-    if (polys.length === 0) continue;
-    paintOne(polys);
+    if (lake.polys.length === 0) continue;
+    paintOne(lake.polys);
   }
   if (lakes) {
     for (const lake of lakes) {
       if (lake.rank > 99) continue;
       if (coveredByDetail(lake.bbox)) continue;
       if (culled(lake.bbox)) continue;
-      const polys = lake.polys.filter((p) => !tooSmall(p.bbox));
-      if (polys.length === 0) continue;
-      paintOne(polys);
+      if (lake.polys.length === 0) continue;
+      paintOne(lake.polys);
     }
   }
   const img = ctx.getImageData(0, 0, v.w, v.h);

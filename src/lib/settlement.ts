@@ -13,11 +13,15 @@ export const SIM_W = 1280;
 export const SIM_H = 1024;
 
 /** Cost-table version: bump when the formula below changes (caches key on it). */
-export const COST_VERSION = 4;
+export const COST_VERSION = 5;
 
 /** Capital head start in cost×km (≈ +50 km reach): the capital seed begins
  *  below zero, so it alone expands further on the same budget. */
 export const CAPITAL_BONUS = 75;
+
+/** Gentle ford cost along drawn rivers (minor streams bend growth slightly;
+ *  big rivers additionally barrier via the mask). */
+export const RIVER_FORD_COST = 1.5;
 
 export interface SimGrid {
   w: number;
@@ -222,7 +226,7 @@ export function buildCosts(
         let cc = b * (1 + Math.min(slope * 6, 3));
         if (eEff > 1500) cc += 2;
         if (eEff > 2500) cc += 4;
-        if (riverMask && riverMask[i] > 0) cc += 2.5;
+        if (riverMask && riverMask[i] > 0) cc += RIVER_FORD_COST;
         cost[i] = cc;
         continue;
       }
@@ -252,7 +256,7 @@ export function buildCosts(
       let c = b * (1 + Math.min(slope * 6, 3));
       if (e > 1500) c += 2;
       if (e > 2500) c += 4;
-      if (riverMask && riverMask[i] > 0) c += 2.5;
+      if (riverMask && riverMask[i] > 0) c += RIVER_FORD_COST;
       cost[i] = c;
     }
   }

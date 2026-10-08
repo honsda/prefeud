@@ -196,6 +196,11 @@ export function neSuperseded(bb: [number, number, number, number]): boolean {
 /** NE ranks that count as BIG rivers (natural-barrier class with bundled detail). */
 export const BIG_RIVER_RANK = 2;
 
+export interface DrawnRiver {
+  lines: Float32Array[];
+  bbox: [number, number, number, number];
+}
+
 export interface BigRiver {
   lines: Float32Array[];
   bbox: [number, number, number, number];
@@ -229,5 +234,30 @@ export function bigRiverFeatures(tol: number): BigRiver[] {
 
 export function riverCount(): number {
   return cache?.length ?? 0;
+}
+
+/** Every river the overlay draws (bundled + NE sans superseded/lake copies,
+ *  simplified at tol): the sim charges gentle ford costs exactly along these
+ *  courses — territories bend around visible streams, never phantom ones. */
+export function simRivers(tol: number): DrawnRiver[] {
+  const out: DrawnRiver[] = [];
+  const push = (f: RiverFeature) => {
+    if (f.lake) return;
+    const lines: Float32Array[] = [];
+    for (const l of f.lines) {
+      const s = simplifyLine(l, tol);
+      if (s) lines.push(s);
+    }
+    if (lines.length === 0) return;
+    out.push({ lines, bbox: f.bbox });
+  };
+  for (const f of detailRivers) push(f);
+  if (cache) {
+    for (const f of cache) {
+      if (neSuperseded(f.bbox)) continue;
+      push(f);
+    }
+  }
+  return out;
 }
 

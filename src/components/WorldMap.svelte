@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import * as PIXI from 'pixi.js';
-  import { loadRivers, bundledRivers, neRivers, neSuperseded, simplifyLine, bigRiverFeatures, riversReady } from '../lib/rivers';
+  import { loadRivers, bundledRivers, neRivers, neSuperseded, simplifyLine, bigRiverFeatures, simRivers, riversReady } from '../lib/rivers';
   import {
     sampleFields,
+    buildRiverMask,
     paintSprawl,
     type SimGrid,
     type SprawlResult,
@@ -535,15 +536,23 @@
       }
       if (stale()) return false;
     }
-    let fields: { elev: Float32Array; bio: Int16Array; land: Uint8Array | null; lake: Uint8Array | null; barrier: Uint8Array | null } | null = null;
+    let fields: FineFields | null = null;
     if (!costs) {
       ensureE0Masks();
       const { elevAt, biomeAt } = makeBoxSamplers(0, 0, dataW, dataH);
       const f = await sampleFields(0, 0, dataW, dataH, 1, elevAt, biomeAt, stale);
       if (!f || stale()) return false;
-      fields = { elev: f.elev, bio: f.bio, land: landMaskE0, lake: lakeMaskE0, barrier: barrierMaskE0 };
+      // fit-view ford raster to match (barriers ship in barrierMaskE0)
+      let ford: Float32Array | null = null;
+      try {
+        const fs = host && host.clientWidth > 0 ? Math.min(host.clientWidth / dataW, host.clientHeight / dataH) : baseScale;
+        ford = buildRiverMask(0, 0, dataW, dataH, 1, simRivers(Math.max(1e-6, 0.25 / ((Math.max(0.01, fs) * dataW) / LON_SPAN))));
+      } catch {
+        ford = null;
+      }
+      fields = { elev: f.elev, bio: f.bio, land: landMaskE0, lake: lakeMaskE0, barrier: barrierMaskE0, ford };
     }
-    // big-river barriers ship inside the fields payload; small streams ignored
+    // big-river barriers + drawn-set ford costs ship inside the fields payload
     const res = await engine().solve({
       tag,
       scope: 'coarse',
@@ -678,17 +687,20 @@
     land: Uint8Array | null;
     lake: Uint8Array | null;
     barrier: Uint8Array | null;
+    ford: Float32Array | null;
   };
 
   /** Sample + rasterize one box's fields on the main thread (caches live
-   *  outside; the worker only ever sees typed arrays). Null when vectors
-   *  aren't ready for masks (falls back to elev/biome rules) or on abort. */
+   *  outside; the worker only ever sees typed arrays). riverTol paces the
+   *  drawn-set ford raster (null skips it). Null when vectors aren't ready
+   *  for masks (falls back to elev/biome rules) or on abort. */
   async function buildFineFields(
     ox: number,
     oy: number,
     w: number,
     h: number,
     cell: number,
+    riverTol: number | null,
     stale: () => boolean,
   ): Promise<FineFields | null> {
     let landM: Uint8Array | null = null;
@@ -707,18 +719,33 @@
         lakeM = null;
       }
       try {
-        const tol = 0.25 / (((world ? world.scale.x : baseScale) * dataW) / LON_SPAN);
-        const feats = bigRiverFeatures(Math.max(1e-6, tol));
+        const feats = bigRiverFeatures(viewTol());
         if (feats.length > 0) barM = rasterizeRiverBarrier(view, feats, cell >= 0.5 ? 2 : 3);
       } catch {
         barM = null;
       }
       if (stale()) return null;
     }
+    // gentle ford costs exactly along drawn rivers (null before vectors load)
+    let ford: Float32Array | null = null;
+    if (riverTol != null) {
+      try {
+        ford = buildRiverMask(ox, oy, w, h, cell, simRivers(riverTol));
+      } catch {
+        ford = null;
+      }
+    }
     const { elevAt, biomeAt } = makeBoxSamplers(ox, oy, ox + w * cell, oy + h * cell);
     const f = await sampleFields(ox, oy, w, h, cell, elevAt, biomeAt, stale);
     if (!f) return null;
-    return { elev: f.elev, bio: f.bio, land: landM, lake: lakeM, barrier: barM };
+    return { elev: f.elev, bio: f.bio, land: landM, lake: lakeM, barrier: barM, ford };
+  }
+
+  /** Screen-px-anchored river tolerance — the same formula as the overlay, so
+   *  sim river geometry == drawn river geometry. */
+  function viewTol(): number {
+    const s = world && host ? world.scale.x : baseScale > 0 ? baseScale : 1;
+    return Math.max(1e-6, 0.25 / ((s * dataW) / LON_SPAN));
   }
 
   /** Coarse boundary ring for one box: lets off-box seeds compete without
@@ -827,14 +854,15 @@
     }
 
     // costs: memory LRU or fresh fields (sampling + vector masks, main thread).
-    // Sea, lakes and big rivers stay unpainted, exactly as drawn.
+    // Sea, lakes and big rivers stay unpainted, exactly as drawn; minor
+    // streams bend growth gently via ford costs on the same drawn courses.
     // (Before vectors load we fall back to the elev/biome rule, then re-sim.)
     const dtag = dataTag();
     const ck = costKey(bx0, by0, w, h, cell, dtag);
     let costs = costMemGet(ck);
     let fields: FineFields | null = null;
     if (!costs) {
-      const f = await buildFineFields(bx0, by0, w, h, cell, stale);
+      const f = await buildFineFields(bx0, by0, w, h, cell, viewTol(), stale);
       if (!f || stale()) return;
       fields = f;
     }
@@ -851,7 +879,7 @@
       const poy = Math.floor(by0 / pc) * pc;
       const pw = Math.max(1, Math.ceil((bx0 + w * cell - pox) / pc));
       const ph = Math.max(1, Math.ceil((by0 + h * cell - poy) / pc));
-      const pf = await buildFineFields(pox, poy, pw, ph, pc, stale);
+      const pf = await buildFineFields(pox, poy, pw, ph, pc, viewTol(), stale);
       if (stale()) return;
       if (pf) {
         const pr = await engine().solve({
@@ -2069,9 +2097,9 @@
 
       {#if sprawlStat}<p class="mt-1 font-mono text-[11px] text-emerald-200/90">{sprawlStat}</p>{/if}
       <p class="mt-1 text-[10px] leading-snug text-gray-500">
-        Voronoi growth on cost terrain: sea, lakes and big rivers block,
-        snow/peaks/deserts costly, fields and settled land cheap. ★ capital
-        reaches further. Click #id to inspect.
+        Voronoi growth on cost terrain: sea, lakes and big rivers block, minor
+        streams bend it gently, snow/peaks/deserts costly, fields and settled
+        land cheap. ★ capital reaches further. Click #id to inspect.
       </p>
     </div>
     {/if}
