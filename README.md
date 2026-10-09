@@ -44,36 +44,14 @@ npm run dev
   whitening. Subtle hillshade keeps island topography readable.
 - **Camera:** smooth eased zoom (wheel/pinch/dblclick/Fit glide to target),
   zoom-out limited to fit, viewport clamped inside the map box — you can never
-  lose the islands.
-- **Settlements (right panel):** place city nodes on the map; each sprawls a
-  cost-weighted Voronoi territory in two tiers: a coarse full-map solve (fixed
-  max budget) picks global winners, then a viewport-native solve (1 sim px =
-  1 map px at the current LOD, cell-grid-snapped and box-anchored) paints a
-  flat raster fill with smooth vector borders (marching-squares + Chaikin,
-  constant screen width) — the classic look, crisp at any zoom. Sea, lakes
-  (any size) and big rivers (bundled detail + NE rank ≤ 2, rasterized as
-  unbroken barriers) stay unpainted, exactly as drawn; minor streams bend
-  growth gently with ford costs on the same drawn courses. Off-screen nodes still compete via boundary
-  injection; stats and centroids are budget-filtered from the coarse distances
-  (no re-solve per slider tick). Snow/peaks/deserts costly; fields and settled
-  land cheap; slope + altitude penalized. Sprawl-level slider sets the
-  cost-distance budget, area color + opacity are pickable, nodes are 6px rings
-  with a toggleable amber centroid. The first node founds a ★ capital with
-  further reach; click #id to inspect cells, supply %, and shared borders.
-  A fog-of-war veil darkens everything beyond scout reach. Hover names the
-  territory under the cursor. Collapsible panels both sides.
-- **Settlement engine (game-ready):** heavy solves run in a Web Worker
-  (`sprawl.worker.ts`, main-thread fallback) over a DOM-free session
-  (`sprawlSession.ts`); node-independent cost grids cache in memory (LRU) and
-  persist across sessions (IndexedDB); budget increases resume the retained
-  frontier instead of re-settling; view settles re-solve only when the box
-  moved. Game logic can query authoritative snapshots —
-  `ownerAt(lon,lat)`, territory cells/neighbors/shared-border lengths —
-  without touching render pixels.
+  lose the islands. Mode swaps keep their own base canvas, so terrain always
+  comes back after biome mode.
 - **Biome layer from your files** (`Documents/sengokujidai/biomes`): the v10
   uint8 ID map (60 classes) converted locally to tiny grayscale tiles
   (E0+E2+E3 ≈ 4.7 MB total — IDs ride in pixel values, NEAREST only so no fake
   classes are ever invented). Toggle Terrain|Biomes; hover names live classes
   ("Rose Field — Autumnal · Highland · Open"); legend chip list included.
+  Every class carries its own hue inside its family (greens stay green, waters
+  stay blue — water itself pinned), so all 60 read apart at a glance.
   Your 140 MB TIFFs stay in Documents — only the derived pixels ship.
 - Offline fallback: flat vector outline with correct region coordinates.

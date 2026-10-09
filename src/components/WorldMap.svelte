@@ -1,32 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import * as PIXI from 'pixi.js';
-  import { loadRivers, bundledRivers, neRivers, neSuperseded, simplifyLine, bigRiverFeatures, simRivers, riversReady } from '../lib/rivers';
-  import {
-    sampleFields,
-    buildRiverMask,
-    paintSprawl,
-    type SimGrid,
-    type SprawlResult,
-  } from '../lib/settlement';
-  import {
-    SprawlSession,
-    type SolveJob,
-    type SolveResult,
-    type SprawlQuery,
-    type QueryResult,
-  } from '../lib/sprawlSession';
-  import SprawlWorkerCtor from '../lib/sprawl.worker.ts?worker';
-  import {
-    costKey,
-    costMemGet,
-    costMemSet,
-    coarseCostKey,
-    idbCostGet,
-    idbCostPut,
-  } from '../lib/sprawlCache';
-  import { ensureBiomeGrid, getBaseGrid, getBaseBiome, makeBoxSamplers } from '../lib/tileEngine';
-  import { loadLand, loadLakes, landReady, lakesReady, rasterizeLandMask, rasterizeLakeMask, rasterizeRiverBarrier } from '../lib/hydro';
+  import { loadRivers, bundledRivers, neRivers, neSuperseded, simplifyLine } from '../lib/rivers';
+  import { loadLand, loadLakes } from '../lib/hydro';
   import {
     REGION,
     ENGINE_TILE,
@@ -53,8 +29,6 @@
     BIOME_LIST,
     engineKey,
     formatElev,
-    getLocalTile,
-    getBiomeTile,
   } from '../lib/tileEngine';
 
   let host: HTMLDivElement;
@@ -78,11 +52,6 @@
   let world: PIXI.Container | null = null;
   let tilesLayer: PIXI.Container | null = null;
   let riverLayer: PIXI.Graphics | null = null;
-  let sprawlLayer: PIXI.Container | null = null;
-  let sprawlSprite: PIXI.Sprite | null = null;
-  let borderGfx: PIXI.Graphics | null = null;
-  let fogSprite: PIXI.Sprite | null = null;
-  let centroidGfx: PIXI.Graphics | null = null;
   let highlight: PIXI.Graphics | null = null;
   let baseScale = 1;
   let interacted = false;
@@ -109,7 +78,8 @@
   let tilesTimer: ReturnType<typeof setTimeout> | null = null;
   let terrainOK = true;
   let warmed = false;
-  let baseCanvas: HTMLCanvasElement | null = null;
+  let baseCanvas: HTMLCanvasElement | null = null; // currently displayed base
+  let terrainBase: HTMLCanvasElement | null = null; // E0 elevation (kept across mode swaps)
   let baseTex: PIXI.Texture | null = null;
   let baseSprite: PIXI.Sprite | null = null;
   // painted canvases awaiting GPU upload (paced: ≤2 per frame, no upload hitches)
@@ -243,1012 +213,6 @@
 
   let dataRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // --- settlement sprawl (Voronoi territories on cost terrain) ---
-  interface SNode {
-    id: number;
-    dx: number; // E0 px
-    dy: number;
-    lon: number;
-    lat: number;
-  }
-  let nodes = $state<SNode[]>([]);
-  let placing = $state(false);
-  let sprawlLevel = $state(25);
-  let sprawlColor = $state('#38bdf8');
-  let sprawlAlpha = $state(35);
-  let rCollapsed = $state(false);
-  let sprawlStat = $state('');
-  let showCentroids = $state(true);
-  let showFog = $state(false);
-  let capitalId = $state<number | null>(null);
-  let selectedId = $state<number | null>(null);
-  let selectedInfo = $state<{
-    cells: number;
-    km2: number;
-    supply: number;
-    neighbors: { id: number; sharedKm2: number; share: number }[];
-  } | null>(null);
-  // unexplored = beyond scout reach of any node (fog-of-war data layer)
-  const FOG_RANGE = 200;
-  // supply radius for the selected territory readout (cost×km)
-  const SUPPLY_RANGE = 120;
-  let nodeSeq = 1;
-  let lastSim: SimGrid | null = null; // fine viewport box descriptor (what you see)
-  let lastSprawl: SprawlResult | null = null; // fine result for the box
-  let coarse: SprawlResult | null = null; // coarse full-map ownership (competition truth)
-  let coarseTag: string | null = null;
-  let landMaskE0: Uint8Array | null = null;
-  let lakeMaskE0: Uint8Array | null = null;
-  let barrierMaskE0: Uint8Array | null = null; // big-river courses (blocked)
-  let maskSig: string | null = null;
-  let sprawlGen = 0;
-  let sprawlTimer: ReturnType<typeof setTimeout> | null = null;
-  // painted fine-solve identity (intent gating + budget grows)
-  let lastFineTag: string | null = null;
-  let lastFineBoxKey: string | null = null;
-  let lastFineBudget = 0;
-  let lastFineGeo: string | null = null;
-  let lastBorderScale = 0;
-  let seedlessTag: string | null = null;
-
-  // Two-tier sprawl (game-ready engine):
-  // - COARSE (full map, cell=1, FIXED max budget): global winners + boundary
-  //   context. Rebuilt only on node/data change — never on pan/zoom/budget
-  //   (Dijkstra distances are budget-independent; stats filter dist<=budget).
-  // - FINE (viewport + margin, native cell): paints 1:1, box-snapped.
-  // Heavy solves run in a Worker (main-thread fallback); cost grids cache
-  // (memory LRU + IDB) so slider/node edits skip sampling; budget growth
-  // resumes the retained frontier; vector contours stroke at screen width.
-  const COARSE_BUDGET = 500; // slider max (100 × 5)
-  const FINE_MARGIN = 12; // E0 px of context around the viewport
-  /** Screen-sized solve budget: native 1:1 cells over the viewport on typical
-   *  displays; coarsen only when the box truly exceeds it. */
-  function maxFineCells(): number {
-    if (!host) return 2200000;
-    const px = host.clientWidth * host.clientHeight;
-    return Math.max(1500000, Math.min(3000000, Math.round(px * 2)));
-  }
-
-  // --- solve transport: Worker w/ main-thread fallback (same session code) ---
-  interface SprawlTransport {
-    solve(job: SolveJob): Promise<SolveResult>;
-    grow(prevTag: string, newTag: string, budget: number): Promise<SolveResult>;
-    query(q: SprawlQuery): Promise<QueryResult>;
-    shutdown(): void;
-  }
-
-  let transport: SprawlTransport | null = null;
-  let workerDead = false; // once tripped, all solves run on the main thread
-  let localFallback: SprawlTransport | null = null;
-
-  function createWorkerTransport(): SprawlTransport | null {
-    try {
-      const worker = new SprawlWorkerCtor();
-      let qseq = 1;
-      // replies echo the solve tag; queries echo their id — overlapping
-      // solves resolve independently, callers discard stale ones by tag
-      const pending = new Map<string, (r: SolveResult | QueryResult) => void>();
-      const failAll = () => {
-        for (const [, res] of pending) {
-          try {
-            res({ ok: false, reason: 'stale' } as SolveResult);
-          } catch {
-            /* ignore */
-          }
-        }
-        pending.clear();
-      };
-      worker.onmessage = (ev: MessageEvent) => {
-        const m = ev.data as { kind: string; tag?: string; key?: string; id?: number } & (SolveResult | QueryResult);
-        if (m.kind === 'solved' || m.kind === 'grown') {
-          const k = m.key ?? m.tag;
-          const res = k ? pending.get(`s:${k}`) : undefined;
-          if (k) pending.delete(`s:${k}`);
-          res?.(m as SolveResult);
-        } else if (m.kind === 'qres') {
-          const res = pending.get(`q:${m.id}`);
-          pending.delete(`q:${m.id}`);
-          res?.(m as QueryResult);
-        }
-      };
-      // a dead worker must never hang solves: fail everything in flight and
-      // permanently fall back to the main-thread session for future solves
-      worker.onerror = () => {
-        workerDead = true;
-        failAll();
-        try {
-          worker.terminate();
-        } catch {
-          /* ignore */
-        }
-        if (transport) {
-          transport = null;
-        }
-        sprawlStat = 'sim worker failed — main-thread fallback';
-        scheduleSprawl();
-      };
-      return {
-        solve: (job) =>
-          new Promise<SolveResult>((resolve) => {
-            pending.set(`s:${job.tag}`, resolve as (r: SolveResult | QueryResult) => void);
-            try {
-              worker.postMessage({ kind: 'solve', job });
-            } catch {
-              pending.delete(`s:${job.tag}`);
-              resolve({ ok: false, reason: 'bad-input' });
-            }
-          }),
-        grow: (prevTag, newTag, budget) =>
-          new Promise<SolveResult>((resolve) => {
-            pending.set(`s:${prevTag}`, resolve as (r: SolveResult | QueryResult) => void);
-            try {
-              worker.postMessage({ kind: 'grow', prev: prevTag, tag: newTag, budget });
-            } catch {
-              pending.delete(`s:${prevTag}`);
-              resolve({ ok: false, reason: 'stale' });
-            }
-          }),
-        query: (q) =>
-          new Promise<QueryResult>((resolve) => {
-            const id = qseq++;
-            pending.set(`q:${id}`, resolve as (r: SolveResult | QueryResult) => void);
-            try {
-              worker.postMessage({ kind: 'query', id, q });
-            } catch {
-              pending.delete(`q:${id}`);
-              resolve({ ok: false });
-            }
-          }),
-        shutdown: () => {
-          pending.clear();
-          try {
-            worker.terminate();
-          } catch {
-            /* ignore */
-          }
-        },
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  function createLocalTransport(): SprawlTransport {
-    const session = new SprawlSession();
-    return {
-      solve: async (job) => {
-        try {
-          return await session.solve(job);
-        } catch {
-          return { ok: false, reason: 'stale' as const };
-        }
-      },
-      grow: async (prevTag, newTag, budget) => {
-        try {
-          return await session.grow(prevTag, newTag, budget);
-        } catch {
-          return { ok: false, reason: 'stale' as const };
-        }
-      },
-      query: (q) => Promise.resolve(session.query(q)),
-      shutdown: () => {},
-    };
-  }
-
-  function engine(): SprawlTransport {
-    if (workerDead) {
-      if (!localFallback) localFallback = createLocalTransport();
-      return localFallback;
-    }
-    if (!transport) transport = createWorkerTransport() ?? createLocalTransport();
-    return transport;
-  }
-
-  /** Geometry identity: nodes + capital + data inputs. Budget-independent —
-   *  Dijkstra distances don't depend on budget, only reachability does, so
-   *  the coarse max-budget solve serves every slider position. Rivers are
-   *  barriers again (big ones) — their arrival reshapes the sim. */
-  function geoTag(): string {
-    const n = nodes.map((s) => `${s.dx.toFixed(2)},${s.dy.toFixed(2)}`).join(';');
-    const f = `${getBaseGrid() ? 1 : 0}${getBaseBiome() ? 1 : 0}${landReady() ? 1 : 0}${lakesReady() ? 1 : 0}${riversReady() ? 1 : 0}`;
-    return `${n}|cap:${capitalId ?? 0}|${f}`;
-  }
-
-  function dataTag(): string {
-    return `${getBaseGrid() ? 1 : 0}${getBaseBiome() ? 1 : 0}${landReady() ? 1 : 0}${lakesReady() ? 1 : 0}${riversReady() ? 1 : 0}`;
-  }
-
-  /** Mean E0-cell area in km² (stats + selected-territory readouts). */
-  function e0CellKm2(): number {
-    const latMid = (REGION.latMax + REGION.latMin) / 2;
-    return (
-      ((LON_SPAN / dataW) * 111.32 * Math.cos((latMid * Math.PI) / 180)) *
-      ((LAT_SPAN / dataH) * 110.57)
-    );
-  }
-
-  /** Seed index of the capital node (-1 when none). */
-  function capitalIndex(): number {
-    if (capitalId == null) return -1;
-    return nodes.findIndex((n) => n.id === capitalId);
-  }
-
-  /** Static full-E0 land/lake masks (the same vectors the tiles paint).
-   *  Sea and lakes stay unpainted; big-river courses barrier both tiers. */
-  function ensureE0Masks(): void {
-    const sig = `${landReady() ? 1 : 0}|${lakesReady() ? 1 : 0}|${riversReady() ? 1 : 0}`;
-    if (maskSig === sig) return;
-    maskSig = sig;
-    landMaskE0 = null;
-    lakeMaskE0 = null;
-    barrierMaskE0 = null;
-    const view = {
-      w: dataW,
-      h: dataH,
-      xOf: (lon: number) => ((lon - REGION.lonMin) / LON_SPAN) * dataW,
-      yOf: (lat: number) => ((REGION.latMax - lat) / LAT_SPAN) * dataH,
-      lonMin: REGION.lonMin,
-      lonMax: REGION.lonMax,
-      latMin: REGION.latMin,
-      latMax: REGION.latMax,
-    };
-    if (landReady()) {
-      try {
-        landMaskE0 = rasterizeLandMask(view);
-      } catch {
-        landMaskE0 = null;
-      }
-    }
-    try {
-      lakeMaskE0 = rasterizeLakeMask(view);
-    } catch {
-      lakeMaskE0 = null;
-    }
-    if (landMaskE0) {
-      try {
-        // fit-view tolerance: same courses the overlay draws zoomed out
-        const fs = host && host.clientWidth > 0 && host.clientHeight > 0
-          ? Math.min(host.clientWidth / dataW, host.clientHeight / dataH)
-          : baseScale;
-        const tol = 0.25 / ((Math.max(0.01, fs) * dataW) / LON_SPAN);
-        const feats = bigRiverFeatures(Math.max(1e-6, tol));
-        if (feats.length > 0) barrierMaskE0 = rasterizeRiverBarrier(view, feats, 2);
-      } catch {
-        barrierMaskE0 = null;
-      }
-    }
-  }
-
-  /** Rebuild the coarse global solution (max budget) when geo inputs changed. */
-  async function ensureCoarse(tag: string, stale: () => boolean): Promise<boolean> {
-    if (coarse && coarseTag === tag) return true;
-    if (seedlessTag === tag) return false;
-    const dtag = dataTag();
-    // costs: memory LRU → IDB → fresh fields (persisted for next session)
-    const ck = costKey(0, 0, dataW, dataH, 1, dtag);
-    let costs = costMemGet(ck);
-    if (!costs) {
-      const stored = await idbCostGet(coarseCostKey(dtag));
-      if (
-        stored && stored.w === dataW && stored.h === dataH &&
-        stored.cell === 1 && stored.ox === 0 && stored.oy === 0
-      ) {
-        costs = stored;
-        costMemSet(ck, costs);
-      }
-      if (stale()) return false;
-    }
-    let fields: FineFields | null = null;
-    if (!costs) {
-      ensureE0Masks();
-      const { elevAt, biomeAt } = makeBoxSamplers(0, 0, dataW, dataH);
-      const f = await sampleFields(0, 0, dataW, dataH, 1, elevAt, biomeAt, stale);
-      if (!f || stale()) return false;
-      // fit-view ford raster to match (barriers ship in barrierMaskE0)
-      let ford: Float32Array | null = null;
-      try {
-        const fs = host && host.clientWidth > 0 ? Math.min(host.clientWidth / dataW, host.clientHeight / dataH) : baseScale;
-        ford = buildRiverMask(0, 0, dataW, dataH, 1, simRivers(Math.max(1e-6, 0.25 / ((Math.max(0.01, fs) * dataW) / LON_SPAN))));
-      } catch {
-        ford = null;
-      }
-      fields = { elev: f.elev, bio: f.bio, land: landMaskE0, lake: lakeMaskE0, barrier: barrierMaskE0, ford };
-    }
-    // big-river barriers + drawn-set ford costs ship inside the fields payload
-    const res = await engine().solve({
-      tag,
-      scope: 'coarse',
-      box: { ox: 0, oy: 0, w: dataW, h: dataH, cell: 1 },
-      seedsE0: nodes.map((n) => ({ x: n.dx, y: n.dy })),
-      budget: COARSE_BUDGET,
-      capital: capitalIndex(),
-      payload: costs
-        ? { costs: { cost: costs.cost, blocked: costs.blocked } }
-        : { fields: fields! },
-      wantDist: true,
-      wantCosts: !costs,
-    });
-    if (!res.ok || stale()) {
-      if (res.reason === 'seedless') seedlessTag = tag;
-      return false;
-    }
-    if (res.costs && !costs) {
-      const built = {
-        w: dataW, h: dataH, cost: res.costs.cost, blocked: res.costs.blocked,
-        ox: 0, oy: 0, cell: 1,
-      };
-      costMemSet(ck, built);
-      idbCostPut(coarseCostKey(dtag), built);
-    }
-    coarse = {
-      owner: res.owner!,
-      dist: res.dist!,
-      counts: res.counts!,
-      centroids: res.centroids!,
-      contours: res.contours ?? [],
-    };
-    coarseTag = tag;
-    return true;
-  }
-
-  function boxView(bx0: number, by0: number, w: number, h: number, cell: number) {
-    const tl = lonLatOf(bx0, by0);
-    const br = lonLatOf(bx0 + w * cell, by0 + h * cell);
-    return {
-      w,
-      h,
-      xOf: (lon: number) => (((lon - REGION.lonMin) / LON_SPAN) * dataW - bx0) / cell,
-      yOf: (lat: number) => (((REGION.latMax - lat) / LAT_SPAN) * dataH - by0) / cell,
-      lonMin: Math.min(tl.lon, br.lon),
-      lonMax: Math.max(tl.lon, br.lon),
-      latMin: Math.min(tl.lat, br.lat),
-      latMax: Math.max(tl.lat, br.lat),
-    };
-  }
-
-  function hexRgb(hex: string): [number, number, number] {
-    const h = hex.replace('#', '');
-    const v = parseInt(h.length === 3 ? h.split('').map((c) => c + c).join('') : h, 16);
-    return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
-  }
-
-  function scheduleSprawl() {
-    if (sprawlTimer) clearTimeout(sprawlTimer);
-    sprawlTimer = setTimeout(() => void recomputeSprawl(), 350);
-  }
-
-  /** Viewport-sized solve box (pre-cell floats) + snapped plan + identity. */
-  function planFineBox(): { bx0: number; by0: number; w: number; h: number; cell: number } | null {
-    let bx0 = 0;
-    let by0 = 0;
-    let bx1 = dataW;
-    let by1 = dataH;
-    if (world && host) {
-      const vw = host.clientWidth;
-      const vh = host.clientHeight;
-      const vx0 = (0 - world.position.x) / world.scale.x;
-      const vy0 = (0 - world.position.y) / world.scale.y;
-      const vx1 = (vw - world.position.x) / world.scale.x;
-      const vy1 = (vh - world.position.y) / world.scale.y;
-      bx0 = Math.min(vx0, vx1) - FINE_MARGIN;
-      by0 = Math.min(vy0, vy1) - FINE_MARGIN;
-      bx1 = Math.max(vx0, vx1) + FINE_MARGIN;
-      by1 = Math.max(vy0, vy1) + FINE_MARGIN;
-    }
-    bx0 = Math.max(0, Math.min(dataW - 1, bx0));
-    by0 = Math.max(0, Math.min(dataH - 1, by0));
-    bx1 = Math.max(1, Math.min(dataW, bx1));
-    by1 = Math.max(1, Math.min(dataH, by1));
-    if (bx1 <= bx0 || by1 <= by0) return null;
-    let cell = Math.max(0.125, 1 / 2 ** curLevel); // 1 sim px = 1 map px
-    let w = Math.max(1, Math.ceil((bx1 - bx0) / cell));
-    let h = Math.max(1, Math.ceil((by1 - by0) / cell));
-    const cap = maxFineCells();
-    while (w * h > cap) {
-      cell *= 2;
-      w = Math.max(1, Math.ceil((bx1 - bx0) / cell));
-      h = Math.max(1, Math.ceil((by1 - by0) / cell));
-    }
-    // snap the origin to the cell grid: sprite pixels land exactly on map pixels
-    bx0 = Math.floor(bx0 / cell) * cell;
-    by0 = Math.floor(by0 / cell) * cell;
-    w = Math.max(1, Math.ceil((bx1 - bx0) / cell));
-    h = Math.max(1, Math.ceil((by1 - by0) / cell));
-    return { bx0, by0, w, h, cell };
-  }
-
-  function fineTagFor(plan: { bx0: number; by0: number; w: number; h: number; cell: number }): {
-    boxKey: string;
-    ftag: string;
-  } {
-    const r = (v: number) => Math.round(v * 1024) / 1024;
-    const boxKey = `${curLevel}|${plan.cell}|${r(plan.bx0)},${r(plan.by0)},${plan.w},${plan.h}`;
-    return { boxKey, ftag: `${geoTag()}|${sprawlLevel * 5}|${boxKey}` };
-  }
-
-  /** Intent gating (#7): view settles re-solve only when the box actually
-   *  moved; otherwise just re-stroke borders for the new scale. */
-  function maybeResrawlView() {
-    if (!ready || nodes.length === 0 || disposed || !world) return;
-    restrokeBordersIfNeeded();
-    const plan = planFineBox();
-    if (!plan) return;
-    const { ftag } = fineTagFor(plan);
-    if (ftag === lastFineTag) return;
-    scheduleSprawl();
-  }
-
-  function restrokeBordersIfNeeded() {
-    if (!lastSprawl || !world || lastBorderScale <= 0) return;
-    if (Math.abs(world.scale.x / lastBorderScale - 1) > 0.02) paintSprawlBorders();
-  }
-
-  /** Warm E3 (else E2) elev + biome tiles covering the sim box before sampling.
-   *  Without this, terrain mode solves from coarse fallback grids while biome
-   *  mode solves from fine cached tiles — same nodes, visibly different
-   *  territories. Warming runs before the cost-cache lookup, so cached costs
-   *  are always built from the best available grids. Bounded and abortable. */
-  async function ensureSimTiles(bx0: number, by0: number, bx1: number, by1: number, stale: () => boolean): Promise<void> {
-    const S = ENGINE_TILE;
-    for (const e of [3, 2]) {
-      const s = 2 ** e;
-      const { nx, ny } = regionTiles(e);
-      const tx0 = Math.max(0, Math.floor((bx0 * s - 1) / S));
-      const tx1 = Math.min(nx - 1, Math.floor((bx1 * s + 1) / S));
-      const ty0 = Math.max(0, Math.floor((by0 * s - 1) / S));
-      const ty1 = Math.min(ny - 1, Math.floor((by1 * s + 1) / S));
-      if (tx0 > tx1 || ty0 > ty1) continue;
-      if ((tx1 - tx0 + 1) * (ty1 - ty0 + 1) > 96) continue; // too wide: coarser level/base
-      const jobs: { x: number; y: number }[] = [];
-      for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) jobs.push({ x: tx, y: ty });
-      let i = 0;
-      const workers = Array.from({ length: Math.min(6, jobs.length) }, async () => {
-        while (i < jobs.length) {
-          if (stale()) return;
-          const t = jobs[i++];
-          try {
-            await getLocalTile(e, t.x, t.y);
-            await getBiomeTile(e, t.x, t.y);
-          } catch {
-            /* offline tile: base grids cover */
-          }
-        }
-      });
-      await Promise.all(workers);
-      if (stale()) return;
-      return; // this level is covered; coarser levels unnecessary
-    }
-  }
-
-  type FineFields = {
-    elev: Float32Array;
-    bio: Int16Array;
-    land: Uint8Array | null;
-    lake: Uint8Array | null;
-    barrier: Uint8Array | null;
-    ford: Float32Array | null;
-  };
-
-  /** Sample + rasterize one box's fields on the main thread (caches live
-   *  outside; the worker only ever sees typed arrays). riverTol paces the
-   *  drawn-set ford raster (null skips it). Null when vectors aren't ready
-   *  for masks (falls back to elev/biome rules) or on abort. */
-  async function buildFineFields(
-    ox: number,
-    oy: number,
-    w: number,
-    h: number,
-    cell: number,
-    riverTol: number | null,
-    stale: () => boolean,
-  ): Promise<FineFields | null> {
-    let landM: Uint8Array | null = null;
-    let lakeM: Uint8Array | null = null;
-    let barM: Uint8Array | null = null;
-    if (landReady()) {
-      const view = boxView(ox, oy, w, h, cell);
-      try {
-        landM = rasterizeLandMask(view);
-      } catch {
-        landM = null;
-      }
-      try {
-        lakeM = rasterizeLakeMask(view);
-      } catch {
-        lakeM = null;
-      }
-      try {
-        const feats = bigRiverFeatures(viewTol());
-        if (feats.length > 0) barM = rasterizeRiverBarrier(view, feats, cell >= 0.5 ? 2 : 3);
-      } catch {
-        barM = null;
-      }
-      if (stale()) return null;
-    }
-    // gentle ford costs exactly along drawn rivers (null before vectors load)
-    let ford: Float32Array | null = null;
-    if (riverTol != null) {
-      try {
-        ford = buildRiverMask(ox, oy, w, h, cell, simRivers(riverTol));
-      } catch {
-        ford = null;
-      }
-    }
-    const { elevAt, biomeAt } = makeBoxSamplers(ox, oy, ox + w * cell, oy + h * cell);
-    const f = await sampleFields(ox, oy, w, h, cell, elevAt, biomeAt, stale);
-    if (!f) return null;
-    return { elev: f.elev, bio: f.bio, land: landM, lake: lakeM, barrier: barM, ford };
-  }
-
-  /** Screen-px-anchored river tolerance — the same formula as the overlay, so
-   *  sim river geometry == drawn river geometry. */
-  function viewTol(): number {
-    const s = world && host ? world.scale.x : baseScale > 0 ? baseScale : 1;
-    return Math.max(1e-6, 0.25 / ((s * dataW) / LON_SPAN));
-  }
-
-  /** Coarse boundary ring for one box: lets off-box seeds compete without
-   *  unioning them into the box (same cost×km units). */
-  function buildInjection(
-    ox: number,
-    oy: number,
-    w: number,
-    h: number,
-    cell: number,
-    geo: string,
-  ): { i: number; dist: number; owner: number }[] | undefined {
-    if (!coarse || coarseTag !== geo) return undefined;
-    const initial: { i: number; dist: number; owner: number }[] = [];
-    const RING = 2;
-    const use = coarse;
-    const probe = (fx: number, fy: number) => {
-      const cx = Math.max(0, Math.min(dataW - 1, Math.floor(ox + (fx + 0.5) * cell)));
-      const cy = Math.max(0, Math.min(dataH - 1, Math.floor(oy + (fy + 0.5) * cell)));
-      const ci = cy * dataW + cx;
-      const o = use.owner[ci];
-      if (o >= 0 && o < nodes.length) initial.push({ i: fy * w + fx, dist: use.dist[ci], owner: o });
-    };
-    for (let x = 0; x < w; x++) {
-      for (let r = 0; r < RING; r++) {
-        probe(x, r);
-        probe(x, h - 1 - r);
-      }
-    }
-    for (let y = RING; y < h - RING; y++) {
-      for (let r = 0; r < RING; r++) {
-        probe(r, y);
-        probe(w - 1 - r, y);
-      }
-    }
-    return initial;
-  }
-
-  async function recomputeSprawl() {
-    if (!ready || disposed) return;
-    if (nodes.length === 0) {
-      clearSprawlVisuals();
-      sprawlStat = '';
-      lastFineTag = null;
-      lastFineBoxKey = null;
-      lastFineGeo = null;
-      return;
-    }
-    // keep the old overlay visible while computing — swap on ready, no flicker
-    sprawlStat = 'computing coarse…';
-    const gen = ++sprawlGen;
-    const stale = () => gen !== sprawlGen || disposed;
-    const geo = geoTag();
-    const budget = sprawlLevel * 5;
-
-    // 1) global competition (fast exit when fresh — never view-driven)
-    if (!coarse || coarseTag !== geo) {
-      const ok = await ensureCoarse(geo, stale);
-      if (stale()) return;
-      if (!ok) {
-        // no land data / seeds off land: drop the stale overlay, say so
-        if (!coarse || coarseTag !== geo) clearSprawlVisuals();
-        sprawlStat = seedlessTag === geo ? 'nodes off land…' : sprawlStat;
-        return;
-      }
-    }
-    sprawlStat = 'computing…';
-
-    // 2) viewport box at native display resolution, snapped to the cell grid
-    const plan = planFineBox();
-    if (!plan || stale()) return;
-    const { boxKey, ftag } = fineTagFor(plan);
-    if (ftag === lastFineTag && lastSprawl && lastSim) {
-      paintSprawlBorders();
-      paintFog();
-      updateSprawlStat();
-      return;
-    }
-
-    // 3) budget-grow fast path (#5): same box + geo, larger budget — resume
-    // the retained frontier instead of re-settling the interior
-    if (
-      lastFineTag && lastFineGeo === geo && lastFineBoxKey === boxKey &&
-      lastSprawl && lastSim && budget > lastFineBudget && coarse && coarseTag === geo
-    ) {
-      const g = await engine().grow(lastFineTag, ftag, budget);
-      if (stale()) return;
-      if (g.ok) {
-        applyFine(g, lastSim, budget, ftag, boxKey, geo);
-        return;
-      }
-      // 'resync'/superseded worker state → fall through to a full solve
-    }
-
-    const { bx0, by0, w, h, cell } = plan;
-
-    // fast path: the fine box IS the full map at cell 1 — paint coarse directly
-    if (cell === 1 && bx0 === 0 && by0 === 0 && w === dataW && h === dataH && coarse && coarseTag === geo) {
-      // descriptor only: paint reads dims + origin + scale, never costs
-      lastSim = { w: dataW, h: dataH, cost: new Float32Array(0), blocked: new Uint8Array(0), ox: 0, oy: 0, cell: 1 };
-      lastSprawl = coarse;
-      applyFineTags(ftag, boxKey, budget, geo);
-      paintSprawlOverlay();
-      updateSprawlStat();
-      return;
-    }
-
-    // costs: memory LRU or fresh fields (sampling + vector masks, main thread).
-    // Sea, lakes and big rivers stay unpainted, exactly as drawn; minor
-    // streams bend growth gently via ford costs on the same drawn courses.
-    // Tiles are warmed first so terrain and biome modes solve identically.
-    // (Before vectors load we fall back to the elev/biome rule, then re-sim.)
-    const dtag = dataTag();
-    const ck = costKey(bx0, by0, w, h, cell, dtag);
-    await ensureSimTiles(bx0 - 4, by0 - 4, bx0 + w * cell + 4, by0 + h * cell + 4, stale);
-    if (stale()) return;
-    let costs = costMemGet(ck);
-    let fields: FineFields | null = null;
-    if (!costs) {
-      const f = await buildFineFields(bx0, by0, w, h, cell, viewTol(), stale);
-      if (!f || stale()) return;
-      fields = f;
-    }
-    // inside seeds compete from 0; outside seeds arrive through the coarse
-    // boundary ring (same cost×km units), so the box stays viewport-sized
-    const initial = buildInjection(bx0, by0, w, h, cell, geo);
-
-    // preview-then-refine: a cell×2 preview paints in ~1s so deep zoom never
-    // sits on stretched coarse blocks, then the native solve swaps in.
-    // The preview sets no tags (budget grows only ever resume full solves).
-    if (cell < 1 && w * h > 800000) {
-      const pc = cell * 2;
-      const pox = Math.floor(bx0 / pc) * pc;
-      const poy = Math.floor(by0 / pc) * pc;
-      const pw = Math.max(1, Math.ceil((bx0 + w * cell - pox) / pc));
-      const ph = Math.max(1, Math.ceil((by0 + h * cell - poy) / pc));
-      const pf = await buildFineFields(pox, poy, pw, ph, pc, viewTol(), stale);
-      if (stale()) return;
-      if (pf) {
-        const pr = await engine().solve({
-          tag: `${ftag}:preview`,
-          scope: 'fine',
-          box: { ox: pox, oy: poy, w: pw, h: ph, cell: pc },
-          seedsE0: nodes.map((n) => ({ x: n.dx, y: n.dy })),
-          budget,
-          capital: capitalIndex(),
-          initial: buildInjection(pox, poy, pw, ph, pc, geo),
-          payload: { fields: pf },
-          wantDist: false,
-        });
-        if (stale()) return;
-        if (pr.ok) {
-          lastSim = { w: pw, h: ph, cost: new Float32Array(0), blocked: new Uint8Array(0), ox: pox, oy: poy, cell: pc };
-          lastSprawl = {
-            owner: pr.owner!,
-            dist: new Float32Array(0),
-            counts: pr.counts!,
-            centroids: pr.centroids!,
-            contours: pr.contours ?? [],
-          };
-          paintSprawlOverlay();
-          sprawlStat = 'refining…';
-        }
-      }
-      if (stale()) return;
-    }
-
-    const res = await engine().solve({
-      tag: ftag,
-      scope: 'fine',
-      box: { ox: bx0, oy: by0, w, h, cell },
-      seedsE0: nodes.map((n) => ({ x: n.dx, y: n.dy })),
-      budget,
-      capital: capitalIndex(),
-      initial,
-      payload: costs
-        ? { costs: { cost: costs.cost, blocked: costs.blocked } }
-        : { fields: fields! },
-      wantDist: false,
-      wantCosts: !costs,
-    });
-    if (!res.ok || stale()) return;
-    if (res.costs && !costs) {
-      costMemSet(ck, { w, h, cost: res.costs.cost, blocked: res.costs.blocked, ox: bx0, oy: by0, cell });
-    }
-    lastSim = { w, h, cost: new Float32Array(0), blocked: new Uint8Array(0), ox: bx0, oy: by0, cell };
-    applyFine(res, lastSim, budget, ftag, boxKey, geo);
-  }
-
-  function applyFineTags(ftag: string, boxKey: string, budget: number, geo: string) {
-    lastFineTag = ftag;
-    lastFineBoxKey = boxKey;
-    lastFineBudget = budget;
-    lastFineGeo = geo;
-  }
-
-  function applyFine(res: SolveResult, sim: SimGrid, budget: number, ftag: string, boxKey: string, geo: string) {
-    lastSprawl = {
-      owner: res.owner!,
-      dist: res.dist ?? lastSprawl?.dist ?? new Float32Array(0),
-      counts: res.counts!,
-      centroids: res.centroids!,
-      contours: res.contours ?? [],
-    };
-    applyFineTags(ftag, boxKey, budget, geo);
-    paintSprawlOverlay();
-    updateSprawlStat(res.ms);
-  }
-
-  /** Budget-aware global stats from the coarse max-budget solve: Dijkstra
-   *  distances don't depend on budget, so filtering dist <= budget gives the
-   *  exact claimed set for any slider position. O(map) scan, no re-solve. */
-  function budgetBreakdown(): { counts: number[]; centroids: { x: number; y: number }[] } {
-    const counts = new Array(nodes.length).fill(0);
-    const sx = new Array(nodes.length).fill(0);
-    const sy = new Array(nodes.length).fill(0);
-    if (coarse && coarseTag === geoTag()) {
-      const budget = sprawlLevel * 5;
-      const o = coarse.owner;
-      const dd = coarse.dist;
-      for (let i = 0; i < o.length; i++) {
-        const k = o[i];
-        if (k >= 0 && k < nodes.length && dd[i] <= budget) {
-          counts[k]++;
-          sx[k] += i % dataW;
-          sy[k] += (i / dataW) | 0;
-        }
-      }
-    }
-    const centroids = nodes.map((_, k) =>
-      counts[k] > 0 ? { x: sx[k] / counts[k], y: sy[k] / counts[k] } : { x: -1, y: -1 },
-    );
-    return { counts, centroids };
-  }
-
-  function updateSprawlStat(ms?: number) {
-    if (nodes.length === 0) {
-      sprawlStat = '';
-      return;
-    }
-    const { counts } = budgetBreakdown();
-    const cells = counts.reduce((a, b) => a + b, 0);
-    const latMid = (REGION.latMax + REGION.latMin) / 2;
-    const kx0 = ((LON_SPAN / dataW) * 111.32 * Math.cos((latMid * Math.PI) / 180));
-    const ky0 = ((LAT_SPAN / dataH) * 110.57);
-    const km2 = Math.round(cells * kx0 * ky0);
-    const timed = ms != null && ms > 0 ? ` · ${(ms / 1000).toFixed(1)}s` : '';
-    sprawlStat = `${cells.toLocaleString('en-US')} px ≈ ${km2.toLocaleString('en-US')} km² across ${nodes.length} node${nodes.length > 1 ? 's' : ''}${timed}`;
-    if (selectedId != null) void refreshSelected();
-  }
-
-  /** Game-logic queries (#6): authoritative snapshots in the engine. Hover
-   *  uses the sync coarse copy below (no round-trip at 60Hz). */
-  function queryTerritory(nodeIdx: number): Promise<QueryResult> {
-    return engine().query({ q: 'hood', node: nodeIdx });
-  }
-
-  function queryOwnerAt(lon: number, lat: number): Promise<QueryResult> {
-    return engine().query({ q: 'ownerAt', lon, lat });
-  }
-
-  /** Sync owner readout from the local coarse snapshot (E0 precision),
-   *  filtered to the live budget frontier (no phantom claims past it). */
-  function coarseOwnerAt(lon: number, lat: number): number {
-    if (!coarse) return -1;
-    const ix = Math.floor(((lon - REGION.lonMin) / LON_SPAN) * dataW);
-    const iy = Math.floor(((REGION.latMax - lat) / LAT_SPAN) * dataH);
-    if (ix < 0 || iy < 0 || ix >= dataW || iy >= dataH) return -1;
-    const i = iy * dataW + ix;
-    if (coarse.dist[i] > sprawlLevel * 5) return -1;
-    return coarse.owner[i];
-  }
-
-  function clearSprawlVisuals() {
-    lastSprawl = null;
-    lastSim = null;
-    lastFineTag = null;
-    lastFineBoxKey = null;
-    lastFineGeo = null;
-    selectedInfo = null;
-    if (sprawlSprite) {
-      sprawlSprite.visible = false;
-      if (sprawlSprite.texture !== PIXI.Texture.EMPTY) sprawlSprite.texture.destroy(true);
-      sprawlSprite.texture = PIXI.Texture.EMPTY;
-    }
-    if (fogSprite) {
-      fogSprite.visible = false;
-      if (fogSprite.texture !== PIXI.Texture.EMPTY) fogSprite.texture.destroy(true);
-      fogSprite.texture = PIXI.Texture.EMPTY;
-    }
-    borderGfx?.clear();
-    centroidGfx?.clear();
-  }
-
-  /** Stroke smooth vector borders at constant screen width. Re-run on zoom
-   *  settle — geometry is zoom-independent, only the width changes. */
-  function paintSprawlBorders() {
-    if (!borderGfx || !world || disposed) return;
-    borderGfx.clear();
-    lastBorderScale = world.scale.x;
-    const paths = lastSprawl?.contours;
-    if (!paths || paths.length === 0) return;
-    for (const p of paths) {
-      if (p.length < 4) continue;
-      borderGfx.moveTo(p[0], p[1]);
-      for (let i = 2; i < p.length; i += 2) borderGfx.lineTo(p[i], p[i + 1]);
-    }
-    borderGfx.stroke({ width: 1.3 / world.scale.x, color: 0xffffff, alpha: 0.5 });
-  }
-
-  /** Fog-of-war data layer: darken everything beyond scout reach of any node.
-   *  Built from the coarse distances (no re-solve), full-map sprite. */
-  function paintFog() {
-    if (!fogSprite || !world || disposed) return;
-    if (!showFog || !coarse || coarseTag !== geoTag()) {
-      fogSprite.visible = false;
-      return;
-    }
-    const o = coarse.owner;
-    const dd = coarse.dist;
-    const canvas = document.createElement('canvas');
-    canvas.width = dataW;
-    canvas.height = dataH;
-    const ctx = canvas.getContext('2d')!;
-    const img = ctx.createImageData(dataW, dataH);
-    const buf = new Uint32Array(img.data.buffer);
-    const FOG = (165 << 24) | (10 << 16) | (6 << 8) | 2; // deep-night veil
-    for (let i = 0; i < o.length; i++) {
-      if (o[i] < 0 || dd[i] > FOG_RANGE) buf[i] = FOG;
-    }
-    ctx.putImageData(img, 0, 0);
-    const tex = PIXI.Texture.from(canvas);
-    tex.source.scaleMode = 'linear';
-    tex.source.autoGenerateMipmaps = false;
-    if (fogSprite.texture !== PIXI.Texture.EMPTY) fogSprite.texture.destroy(true);
-    fogSprite.texture = tex;
-    fogSprite.position.set(0, 0);
-    fogSprite.scale.set(1, 1);
-    fogSprite.visible = true;
-  }
-
-  function paintSprawlOverlay() {
-    if (!lastSprawl || !lastSim || !world || !sprawlLayer || disposed) return;
-    const sim = lastSim;
-    const [r, g, b] = hexRgb(sprawlColor);
-    // flat raster fill — vector contours carry the borders (crisp at any zoom)
-    const canvas = paintSprawl(lastSprawl, sim.w, sim.h, r, g, b, sprawlAlpha / 100, false);
-    const tex = PIXI.Texture.from(canvas);
-    tex.source.scaleMode = 'nearest';
-    tex.source.autoGenerateMipmaps = false;
-    if (!sprawlSprite) {
-      sprawlSprite = new PIXI.Sprite(tex);
-      sprawlLayer.addChildAt(sprawlSprite, 0);
-    } else {
-      if (sprawlSprite.texture !== PIXI.Texture.EMPTY) sprawlSprite.texture.destroy(true);
-      sprawlSprite.texture = tex;
-    }
-    // box-anchored: 1 canvas px = sim.cell world units at (ox, oy)
-    sprawlSprite.position.set(sim.ox, sim.oy);
-    sprawlSprite.scale.set(sim.cell, sim.cell);
-    sprawlSprite.visible = true;
-    paintSprawlBorders();
-    paintFog();
-    // seeds (small 6px rings, gold for the capital) + centroids (toggleable)
-    centroidGfx?.clear();
-    const cg = centroidGfx!;
-    const { centroids } = budgetBreakdown();
-    const capIdx = capitalIndex();
-    nodes.forEach((n, k) => {
-      const isCap = k === capIdx;
-      cg.circle(n.dx, n.dy, 3);
-      cg.stroke({ width: 2 / world!.scale.x, color: isCap ? 0xffd700 : 0xffffff });
-      cg.circle(n.dx, n.dy, 1.5);
-      cg.fill({ color: isCap ? 0xffd700 : 0xffffff });
-      if (!showCentroids) return;
-      const c = centroids[k];
-      if (!c || c.x < 0) return;
-      cg.circle(c.x, c.y, 4);
-      cg.fill({ color: 0xfbbf24 });
-    });
-  }
-
-  function addNodeAt(dx: number, dy: number) {
-    const { lon, lat } = lonLatOf(dx, dy);
-    const id = nodeSeq++;
-    nodes = [...nodes, { id, dx, dy, lon, lat }];
-    if (capitalId == null) capitalId = id; // first node founds the capital
-    scheduleSprawl();
-  }
-
-  function removeNode(id: number) {
-    nodes = nodes.filter((n) => n.id !== id);
-    if (capitalId === id) capitalId = nodes.length > 0 ? nodes[0].id : null;
-    if (selectedId === id) {
-      selectedId = null;
-      selectedInfo = null;
-    }
-    scheduleSprawl();
-  }
-
-  function setCapital(id: number) {
-    if (capitalId === id) return;
-    capitalId = id;
-    scheduleSprawl(); // capital head start reshapes ownership
-  }
-
-  function selectNode(id: number | null) {
-    selectedId = id;
-    selectedInfo = null;
-    if (id != null) void refreshSelected();
-  }
-
-  /** Selected-territory inspect (#6 in action): worker hood (neighbors +
-   *  shared borders) + local supply scan over the coarse snapshot. */
-  async function refreshSelected() {
-    const id = selectedId;
-    if (id == null || disposed) return;
-    const idx = nodes.findIndex((n) => n.id === id);
-    if (idx < 0 || !coarse || coarseTag !== geoTag()) {
-      selectedInfo = null;
-      return;
-    }
-    const snap = { coarse, idx, budget: sprawlLevel * 5 };
-    let hood: QueryResult;
-    try {
-      hood = await engine().query({ q: 'hood', node: idx });
-    } catch {
-      return;
-    }
-    if (selectedId !== id || disposed || !coarse || coarseTag !== geoTag()) return;
-    if (!hood.ok) {
-      selectedInfo = null;
-      return;
-    }
-    const perKm2 = e0CellKm2();
-    const cells = hood.cells ?? 0;
-    // supply: claimed cells within SUPPLY_RANGE of the node (min-dist approx)
-    const o = snap.coarse.owner;
-    const dd = snap.coarse.dist;
-    let supplied = 0;
-    for (let i = 0; i < o.length; i++) {
-      if (o[i] === idx && dd[i] <= SUPPLY_RANGE) supplied++;
-    }
-    const sharedTotal = (hood.neighbors ?? []).reduce((a, b) => a + b.shared, 0) || 1;
-    selectedInfo = {
-      cells,
-      km2: Math.round(cells * perKm2),
-      supply: cells > 0 ? Math.round((supplied / cells) * 100) : 0,
-      neighbors: (hood.neighbors ?? []).map((nb) => ({
-        id: nodes[nb.node]?.id ?? -1,
-        sharedKm2: Math.round(nb.shared * perKm2),
-        share: Math.round((nb.shared / sharedTotal) * 100),
-      })),
-    };
-  }
-
-  function togglePlacing() {
-    placing = !placing;
-    if (canvasElRef) canvasElRef.style.cursor = placing ? 'crosshair' : 'grab';
-  }
-
-  function onKeyDown(e: KeyboardEvent) {
-    if (e.key === 'Escape' && placing) togglePlacing();
-  }
   /** Collapse rapid successive dataset arrivals into one re-stream. */
   function scheduleDataRefresh() {
     if (dataRefreshTimer) clearTimeout(dataRefreshTimer);
@@ -1288,7 +252,6 @@
       warmCenter();
       updateStats();
       redrawRivers();
-      maybeResrawlView(); // settled view: re-solve only if the box moved
       return;
     }
 
@@ -1330,7 +293,6 @@
     }
     updateStats();
     redrawRivers();
-    maybeResrawlView(); // settled view: re-solve only if the box moved
   }
 
   function warmCenter() {
@@ -1457,14 +419,14 @@
         return;
       }
     }
-    if (mode === 'biome' && biomeBase) attachBase(biomeBase);
-    else if (baseCanvas && mode === 'terrain') attachBase(baseCanvas);
+    if (mode === 'biome' && biomeBase) attachBase(biomeBase, 'biome');
+    else if (mode === 'terrain' && terrainBase) attachBase(terrainBase, 'terrain');
     clearPaintedCache();
     refreshAllTiles();
     status = mode === 'biome' ? 'Biomes live — hover for names' : 'Japan live — zoom in, detail streams';
   }
 
-  function attachBase(canvas: HTMLCanvasElement) {
+  function attachBase(canvas: HTMLCanvasElement, kind: 'terrain' | 'biome') {
     if (!app || !world) return;
     // replace any previous base (mode swaps) instead of stacking
     if (baseSprite) {
@@ -1482,6 +444,8 @@
     base.scale.set(dataW / canvas.width, dataH / canvas.height);
     world.addChildAt(base, 0);
     baseCanvas = canvas;
+    if (kind === 'terrain') terrainBase = canvas;
+    else biomeBase = canvas;
     baseTex = texture;
     baseSprite = base;
     fitToScreen(false);
@@ -1601,18 +565,11 @@
       loadRivers().then(() => {
         if (disposed) return;
         redrawRivers(); // overlay picks up NE background rivers
-        scheduleSprawl(); // big-river barriers may have arrived
-      });
-      // biome IDs power settlement costs — decode early (tiny local file)
-      ensureBiomeGrid().then(() => {
-        if (disposed) return;
-        scheduleSprawl();
       });
       const hydroArrived = () => {
         if (disposed) return;
         applyLakesToBase();
         scheduleDataRefresh(); // repaint pre-mask tiles with true coasts
-        scheduleSprawl(); // vectors arrived → territories snap onto true land
       };
       loadLand().then(hydroArrived, () => {});
       loadLakes().then(hydroArrived, () => {});
@@ -1629,7 +586,6 @@
       host.prepend(app.canvas as HTMLCanvasElement);
       const canvasEl = app.canvas as HTMLCanvasElement;
       canvasElRef = canvasEl;
-      window.addEventListener('keydown', onKeyDown);
       canvasEl.style.position = 'absolute';
       canvasEl.style.inset = '0';
       canvasEl.style.touchAction = 'none';
@@ -1653,15 +609,6 @@
       world.addChild(tilesLayer);
       riverLayer = new PIXI.Graphics();
       world.addChild(riverLayer); // above tiles, crisp at any zoom
-      sprawlLayer = new PIXI.Container();
-      world.addChild(sprawlLayer); // settlement territories above rivers
-      borderGfx = new PIXI.Graphics();
-      sprawlLayer.addChild(borderGfx); // smooth vector borders above the fill
-      fogSprite = new PIXI.Sprite();
-      fogSprite.visible = false;
-      world.addChild(fogSprite); // fog-of-war veil over map + territories
-      centroidGfx = new PIXI.Graphics();
-      world.addChild(centroidGfx); // markers stay visible above the fog
       highlight = new PIXI.Graphics();
       world.addChild(highlight); // picker stays topmost (never inside riverLayer: clear() would drop it)
 
@@ -1677,7 +624,7 @@
           paintLakesOntoBase(s2);
           laked.add(s2);
         }
-        attachBase(s2); // focus-pull reveal covers the transition
+        attachBase(s2, 'terrain'); // focus-pull reveal covers the transition
         pixelCount = `Japan E0 ${dataW}×${dataH} · virtual up to ${virtualSize(maxLevel)}`;
         progress = 1;
         ready = true;
@@ -1685,7 +632,6 @@
           ? 'Japan live — zoom in, detail streams'
           : 'Japan live — coasts approximate (mask offline)';
         updateTiles();
-        scheduleSprawl(); // pick up any nodes placed during load
       } catch (err) {
         console.warn('Terrain unavailable, vector fallback:', err);
         terrainOK = false;
@@ -1702,7 +648,7 @@
             return c;
           })();
         if (disposed) return;
-        attachBase(canvas);
+        attachBase(canvas, 'terrain');
         pixelCount = `Japan E0 ${dataW}×${dataH} · offline outline`;
         ready = true;
         status = 'Offline outline (no terrain)';
@@ -1710,15 +656,8 @@
         redrawRivers(); // overlay still works: rivers need no terrain
       }
 
-      // --- pan (+ settlement placement intercepts first) ---
+      // --- pan ---
       canvasEl.addEventListener('pointerdown', (e) => {
-        if (placing && pointers.size === 0) {
-          const hit = screenToData(e.clientX, e.clientY);
-          if (hit) addNodeAt(hit.dx, hit.dy);
-          placing = false;
-          canvasEl.style.cursor = 'grab';
-          return;
-        }
         pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
         canvasEl.setPointerCapture(e.pointerId);
         dragging = true;
@@ -1843,15 +782,7 @@
           const s = sampleAny(lat, lon);
           if (s) elevTxt = ` · ${formatElev(s.elev)} (L${s.z})`;
         }
-        // sync territory readout from the local coarse snapshot (#6, no round-trip)
-        let terrTxt = '';
-        if (nodes.length > 0) {
-          const to = coarseOwnerAt(lon, lat);
-          if (to >= 0 && to < nodes.length) terrTxt = ` · #${
-            nodes[to].id
-          } territory`;
-        }
-        hoverInfo = `${Math.abs(lat).toFixed(2)}°${ns} ${Math.abs(lon).toFixed(2)}°${ew}${elevTxt}${terrTxt}`;
+        hoverInfo = `${Math.abs(lat).toFixed(2)}°${ns} ${Math.abs(lon).toFixed(2)}°${ew}${elevTxt}`;
         if (tooltip) {
           tooltip.style.opacity = '1';
           const rect = host.getBoundingClientRect();
@@ -1904,13 +835,8 @@
     return () => {
       disposed = true;
       tileEpoch++;
-      sprawlGen++;
       if (tilesTimer) clearTimeout(tilesTimer);
       if (dataRefreshTimer) clearTimeout(dataRefreshTimer);
-      if (sprawlTimer) clearTimeout(sprawlTimer);
-      transport?.shutdown();
-      transport = null;
-      window.removeEventListener('keydown', onKeyDown);
       cancelAnimationFrame(raf);
       app?.destroy(true, { children: true, texture: true });
       app = null;
@@ -2027,122 +953,6 @@
         Zoomed out: smooth base illusion · zoom in: only your viewport streams in full detail.
       </p>
       <p class="mt-1 font-mono text-[10px] leading-snug text-gray-500">Local elevation + hydro · no external requests</p>
-    </div>
-    {/if}
-  </div>
-
-  <!-- settlement panel -->
-  <div class="pointer-events-none absolute right-4 top-4 z-10 w-64">
-    {#if rCollapsed}
-      <button
-        onclick={() => (rCollapsed = false)}
-        class="pointer-events-auto ml-auto block rounded-xl border border-white/10 bg-black/60 px-3 py-2 font-mono text-[11px] text-gray-200 shadow-2xl backdrop-blur-md hover:bg-white/10"
-        title="Open settlement panel"
-      >
-        🏯 settle
-      </button>
-    {:else}
-    <div class="pointer-events-auto rounded-2xl border border-white/10 bg-black/60 p-4 shadow-2xl backdrop-blur-md">
-      <div class="flex items-center gap-2">
-        <h2 class="text-sm font-bold tracking-widest text-white uppercase">Settlement</h2>
-        <button
-          onclick={() => (rCollapsed = true)}
-          class="ml-auto rounded-md px-1.5 py-0.5 font-mono text-[11px] text-gray-400 hover:bg-white/10 hover:text-white"
-          title="Collapse panel"
-        >
-          ✕
-        </button>
-      </div>
-
-      <button
-        onclick={togglePlacing}
-        class="mt-3 w-full rounded-lg px-2.5 py-2 font-mono text-[11px] transition
-          {placing ? 'bg-amber-300 font-bold text-black' : 'bg-white/10 text-gray-200 hover:bg-white/20'}"
-      >
-        {placing ? 'Click map to place… (Esc cancels)' : '⊕ Place settlement node'}
-      </button>
-
-      <label class="mt-3 block font-mono text-[11px] text-gray-300">
-        Sprawl level: <span class="font-bold text-white">{sprawlLevel}</span>
-        <input
-          type="range" min="0" max="100" step="1" bind:value={sprawlLevel} oninput={scheduleSprawl}
-          class="mt-1 w-full accent-emerald-400"
-        />
-      </label>
-
-      <div class="mt-2 flex items-center gap-2">
-        <label class="font-mono text-[11px] text-gray-300">Area</label>
-        <input type="color" bind:value={sprawlColor} oninput={paintSprawlOverlay} class="h-7 w-10 cursor-pointer rounded bg-transparent" />
-        <input type="range" min="5" max="90" step="1" bind:value={sprawlAlpha} oninput={paintSprawlOverlay} class="w-full accent-emerald-400" title="Opacity" />
-        <span class="font-mono text-[11px] text-gray-300">{sprawlAlpha}%</span>
-      </div>
-
-      <label class="mt-2 flex cursor-pointer items-center gap-2 font-mono text-[11px] text-gray-300">
-        <input type="checkbox" bind:checked={showCentroids} oninput={paintSprawlOverlay} class="accent-amber-300" />
-        Centroids
-      </label>
-
-      <label class="mt-1 flex cursor-pointer items-center gap-2 font-mono text-[11px] text-gray-300" title="Darken everything beyond scout reach">
-        <input type="checkbox" bind:checked={showFog} oninput={paintFog} class="accent-indigo-400" />
-        Fog of war
-      </label>
-
-      {#if nodes.length > 0}
-        <div class="mt-2 max-h-28 overflow-y-auto pr-1">
-          {#each nodes as n}
-            <div class="flex items-center gap-1.5 py-px font-mono text-[11px] text-gray-300">
-              <button
-                onclick={() => setCapital(n.id)}
-                class="{capitalId === n.id ? 'text-amber-300' : 'text-gray-600 hover:text-amber-200'}"
-                title={capitalId === n.id ? 'Capital (+reach)' : 'Make capital (+reach)'}
-              >★</button>
-              <button
-                onclick={() => selectNode(selectedId === n.id ? null : n.id)}
-                class="font-bold {selectedId === n.id ? 'text-sky-300' : 'text-white'} hover:text-sky-200"
-                title="Inspect territory"
-              >#{n.id}</button>
-              <span>{Math.abs(n.lat).toFixed(2)}°{n.lat >= 0 ? 'N' : 'S'} {Math.abs(n.lon).toFixed(2)}°{n.lon >= 0 ? 'E' : 'W'}</span>
-              <button onclick={() => removeNode(n.id)} class="ml-auto text-gray-500 hover:text-red-300" title="Remove node">✕</button>
-            </div>
-          {/each}
-        </div>
-        {#if selectedInfo}
-          <div class="mt-1 rounded-lg bg-white/5 px-2 py-1.5 font-mono text-[11px] text-gray-300">
-            <div class="flex items-center gap-1.5">
-              <span class="font-bold text-white">Territory #{selectedId}</span>
-              <span class="text-emerald-200/90">{selectedInfo.cells.toLocaleString('en-US')} px · {selectedInfo.km2.toLocaleString('en-US')} km²</span>
-              <button onclick={() => selectNode(null)} class="ml-auto text-gray-500 hover:text-white" title="Close">✕</button>
-            </div>
-            <div class="mt-0.5 text-sky-200/90">Supply {selectedInfo.supply}% in range</div>
-            {#if selectedInfo.neighbors.length > 0}
-              <div class="mt-0.5 text-gray-400">Borders:</div>
-              {#each selectedInfo.neighbors as nb}
-                <div class="flex justify-between text-gray-300">
-                  <span>#{nb.id}</span>
-                  <span>{nb.sharedKm2.toLocaleString('en-US')} km² · {nb.share}%</span>
-                </div>
-              {/each}
-            {:else}
-              <div class="mt-0.5 text-gray-500">No land borders.</div>
-            {/if}
-          </div>
-        {/if}
-        <button
-          onclick={() => { nodes = []; capitalId = null; selectedId = null; selectedInfo = null; scheduleSprawl(); }}
-          class="mt-1 rounded-lg bg-white/10 px-2.5 py-1 font-mono text-[11px] text-gray-300 hover:bg-white/20"
-        >
-          Clear all
-        </button>
-      {:else}
-        <p class="mt-2 font-mono text-[11px] text-gray-500">No nodes yet — place one to seed a territory.</p>
-      {/if}
-
-      {#if sprawlStat}<p class="mt-1 font-mono text-[11px] text-emerald-200/90">{sprawlStat}</p>{/if}
-      <p class="mt-1 text-[10px] leading-snug text-gray-500">
-        Voronoi growth on cost terrain: sea, lakes and big rivers block, minor
-        streams bend it gently, snow/peaks/deserts costly, fields and settled
-        land cheap. ★ capital reaches further. Click #id to inspect.
-      </p>
     </div>
     {/if}
   </div>
