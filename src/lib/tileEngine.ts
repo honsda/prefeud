@@ -602,7 +602,9 @@ export async function paintBiomeTile(
 
 let baseBiome: Uint8Array | null = null;
 
-/** Ensure the biome ID grid is decoded (cheap one-time local fetch). */
+/** Ensure the biome ID grid is decoded (cheap one-time local fetch).
+ *  biobase.png ships at half E0 resolution (≈34 KB) and is nearest-upscaled
+ *  to full E0 here, so every consumer keeps exact-size indexing. */
 export async function ensureBiomeGrid(): Promise<Uint8Array | null> {
   if (baseBiome) return baseBiome;
   try {
@@ -616,8 +618,22 @@ export async function ensureBiomeGrid(): Promise<Uint8Array | null> {
     ctx0.drawImage(bmp, 0, 0);
     bmp.close();
     const d = ctx0.getImageData(0, 0, c.width, c.height).data;
-    const grid = new Uint8Array(c.width * c.height);
-    for (let i = 0; i < grid.length; i++) grid[i] = d[i * 4];
+    const raw = new Uint8Array(c.width * c.height);
+    for (let i = 0; i < raw.length; i++) raw[i] = d[i * 4];
+    const { w: W, h: H } = regionSize(0);
+    if (c.width === W && c.height === H) {
+      baseBiome = raw;
+      return raw;
+    }
+    // half-res source: nearest-upscale to E0 (IDs are categorical)
+    const sx = W / c.width;
+    const sy = H / c.height;
+    if (!Number.isInteger(sx) || !Number.isInteger(sy) || sx < 1 || sy < 1) return null;
+    const grid = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) {
+      const sy0 = Math.min(c.height - 1, Math.floor(y / sy));
+      for (let x = 0; x < W; x++) grid[y * W + x] = raw[sy0 * c.width + Math.min(c.width - 1, Math.floor(x / sx))];
+    }
     baseBiome = grid;
     return grid;
   } catch {
