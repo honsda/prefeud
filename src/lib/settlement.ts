@@ -13,7 +13,7 @@ export const SIM_W = 1280;
 export const SIM_H = 1024;
 
 /** Cost-table version: bump when the formula below changes (caches key on it). */
-export const COST_VERSION = 5;
+export const COST_VERSION = 6;
 
 /** Capital head start in cost×km (≈ +50 km reach): the capital seed begins
  *  below zero, so it alone expands further on the same budget. */
@@ -199,16 +199,16 @@ export function buildCosts(
       }
       const e = elev[i];
       if (landM) {
-        // vector land wins: below-sea-level land (polders etc.) still
-        // settles; missing elevation degrades to flat ground, not water
+        // vector land wins, unconditionally: below-sea-level land (polders
+        // etc.) still settles, water-named biomes on true land (coarse-grid
+        // coastal bleed) degrade to plain ground instead of blocking, and
+        // missing elevation degrades to flat ground, not water
         const eEff = Number.isFinite(e) ? Math.max(e, 0.5) : 10;
         let b = 2;
         const id = bio[i];
-        if (id >= 0) b = costOfBiome(id);
-        if (!Number.isFinite(b)) {
-          cost[i] = Infinity;
-          blocked[i] = 1;
-          continue;
+        if (id >= 0) {
+          const cb = costOfBiome(id);
+          b = Number.isFinite(cb) ? cb : 2;
         }
         let slope = 0;
         const eL = elev[y * w + Math.max(0, x - 1)];
@@ -466,11 +466,12 @@ function smoothRing(
     }
     pts = ch;
   } else if (p.length > 2) {
-    // two Chaikin rounds: the first takes the corners off, the second melts
-    // the grid staircase (shores included) into flowing curves. Deviation from
-    // the true edge stays sub-pixel; the stroke width covers it.
+    // three Chaikin rounds melt the grid staircase (shores included) into
+    // flowing curves; deviation from the true edge stays near a pixel and
+    // the stroke width covers it. Chaikin never creates new extrema, so no
+    // loops or kinks can appear — only stiffness disappears.
     let cur: Pt[] = p;
-    for (let iter = 0; iter < 2; iter++) {
+    for (let iter = 0; iter < 3; iter++) {
       const ch: Pt[] = [cur[0]];
       for (let k = 0; k < cur.length - 1; k++) {
         const A = cur[k];

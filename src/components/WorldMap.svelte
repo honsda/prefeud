@@ -53,6 +53,8 @@
     BIOME_LIST,
     engineKey,
     formatElev,
+    getLocalTile,
+    getBiomeTile,
   } from '../lib/tileEngine';
 
   let host: HTMLDivElement;
@@ -681,6 +683,43 @@
     if (Math.abs(world.scale.x / lastBorderScale - 1) > 0.02) paintSprawlBorders();
   }
 
+  /** Warm E3 (else E2) elev + biome tiles covering the sim box before sampling.
+   *  Without this, terrain mode solves from coarse fallback grids while biome
+   *  mode solves from fine cached tiles — same nodes, visibly different
+   *  territories. Warming runs before the cost-cache lookup, so cached costs
+   *  are always built from the best available grids. Bounded and abortable. */
+  async function ensureSimTiles(bx0: number, by0: number, bx1: number, by1: number, stale: () => boolean): Promise<void> {
+    const S = ENGINE_TILE;
+    for (const e of [3, 2]) {
+      const s = 2 ** e;
+      const { nx, ny } = regionTiles(e);
+      const tx0 = Math.max(0, Math.floor((bx0 * s - 1) / S));
+      const tx1 = Math.min(nx - 1, Math.floor((bx1 * s + 1) / S));
+      const ty0 = Math.max(0, Math.floor((by0 * s - 1) / S));
+      const ty1 = Math.min(ny - 1, Math.floor((by1 * s + 1) / S));
+      if (tx0 > tx1 || ty0 > ty1) continue;
+      if ((tx1 - tx0 + 1) * (ty1 - ty0 + 1) > 96) continue; // too wide: coarser level/base
+      const jobs: { x: number; y: number }[] = [];
+      for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) jobs.push({ x: tx, y: ty });
+      let i = 0;
+      const workers = Array.from({ length: Math.min(6, jobs.length) }, async () => {
+        while (i < jobs.length) {
+          if (stale()) return;
+          const t = jobs[i++];
+          try {
+            await getLocalTile(e, t.x, t.y);
+            await getBiomeTile(e, t.x, t.y);
+          } catch {
+            /* offline tile: base grids cover */
+          }
+        }
+      });
+      await Promise.all(workers);
+      if (stale()) return;
+      return; // this level is covered; coarser levels unnecessary
+    }
+  }
+
   type FineFields = {
     elev: Float32Array;
     bio: Int16Array;
@@ -856,9 +895,12 @@
     // costs: memory LRU or fresh fields (sampling + vector masks, main thread).
     // Sea, lakes and big rivers stay unpainted, exactly as drawn; minor
     // streams bend growth gently via ford costs on the same drawn courses.
+    // Tiles are warmed first so terrain and biome modes solve identically.
     // (Before vectors load we fall back to the elev/biome rule, then re-sim.)
     const dtag = dataTag();
     const ck = costKey(bx0, by0, w, h, cell, dtag);
+    await ensureSimTiles(bx0 - 4, by0 - 4, bx0 + w * cell + 4, by0 + h * cell + 4, stale);
+    if (stale()) return;
     let costs = costMemGet(ck);
     let fields: FineFields | null = null;
     if (!costs) {
